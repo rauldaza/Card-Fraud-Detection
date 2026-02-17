@@ -8,5 +8,6 @@ wheels/
 
 *.sh
 *.csv
+*.pkl
 # Virtual environments
 .venv

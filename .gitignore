@@ -6,6 +6,7 @@ dist/
 wheels/
 *.egg-info
 
+*.pth
 *.sh
 *.csv
 *.pkl

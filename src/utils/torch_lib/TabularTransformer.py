@@ -5,22 +5,19 @@ This module contains the TabularTransformer model and the TransactionDataset cla
 # Models deep L
 import torch
 import torch.nn as nn
-# Data
+import torch.nn.functional as F
+# Data: TransactionDataset
 import pandas as pd
 from torch.utils.data import Dataset
-# Importing
+# Importing: TransactionDataset
 import pickle
 # Math
 import numpy as np
+# Sklearn: Wrapper
+from sklearn.base import BaseEstimator, ClassifierMixin
 
 # Importing custom classes
 from utils.skl_lib.LibPreTabTransformer import MaskedPCA, shift_plus_one
-
-# Makes sure that the proper libaries are used for the preprocesing pipeline
-import __main__
-__main__.MaskedPCA = MaskedPCA
-__main__.shift_plus_one = shift_plus_one
-
 
 
 
@@ -40,7 +37,10 @@ class TabularTransformer(nn.Module):
             embed_dim (int): Dimension of the embeddings for the categorical features.
         '''
         super().__init__()
-        
+        self.n_categories = n_categories
+        self.n_continuous = n_continuous
+        self.n_classes = n_classes
+        self.embed_dim = embed_dim
         # Embeddings definition for the categorical features
         self.embeddings = nn.ModuleList([
             nn.Embedding(num_cat, embed_dim) for num_cat in n_categories
@@ -150,3 +150,79 @@ class TransactionDataset(Dataset):
 
             counts.append(int(self.Xp_cat[:, i].max()) + 1)
         return counts
+
+
+class TabularTransformerWrapper(BaseEstimator, ClassifierMixin):
+    '''
+    Wrapper for the TabularTransformer model to make it compatible with scikit-learn.
+    '''
+    def __init__(self, model: TabularTransformer, batch_size=64, device=None):
+        '''
+        Args:
+            model (TabularTransformer): The TabularTransformer model to wrap.
+            batch_size (int): The batch size to use for predicting.
+            device (str): The device to use for predicting.
+        '''
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+            
+        self.model = model.to(self.device) 
+        self.model.eval()
+
+
+        self.n_cont = model.n_continuous
+        self.n_cat = len(model.n_categories)
+        self.batch_size = batch_size
+
+    def fit(self, X, y=None):
+        '''the fit method is not implemented for this wrapper'''
+        return self
+
+    def predict_proba(self, X):
+        '''
+        Predicts the probability of each class for each sample in X.
+
+        Args:
+            X (np.ndarray): Matrix of float values with the features.
+
+        Returns:
+            np.ndarray: Matrix of float values with the output probabilities.
+        '''
+        
+        X = np.array(X)
+        n_samples = X.shape[0]
+        all_probs = []
+        # disables the DAG of pytorch
+        with torch.no_grad():
+            # Iterates over the data in batches to manage memory usage
+            for i in range(0, n_samples, self.batch_size):
+                
+                X_batch = X[i : i + self.batch_size]
+
+                Xb_cat = torch.tensor(X_batch[:, self.n_cont:], dtype=torch.long).to(self.device)
+                Xb_cont = torch.tensor(X_batch[:, 0:self.n_cont], dtype=torch.float32).to(self.device)
+        
+                
+                logits = self.model(Xb_cat, Xb_cont)
+                probs = F.softmax(logits, dim=1)
+                
+                
+                all_probs.append(probs.cpu().numpy())
+
+        
+        return np.vstack(all_probs)
+
+    def predict(self, X):
+        '''
+        Predicts the class for each sample in X.
+
+        Args:
+            X (np.ndarray): Matrix of float values with the features.
+
+        Returns:
+            np.ndarray: Array of int values with the output classes.
+        '''
+        probs = self.predict_proba(X)
+        return probs.argmax(axis=1)

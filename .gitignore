@@ -5,10 +5,12 @@ build/
 dist/
 wheels/
 *.egg-info
-
+*.db
 *.pth
 *.sh
 *.csv
+*.feather
 *.pkl
+*.json
 # Virtual environments
 .venv

@@ -1,0 +1,33 @@
+# ─────────────────────────────────────────────────────────────
+#  mlops-pipeline (Train/Eval) — Container Dependencies
+#
+#  These run INSIDE the SageMaker container on AWS.
+#  Your local environment is managed by pyproject.toml + uv.
+#
+#  NOTE: torch is installed separately in the Dockerfile
+#        with --index-url for CUDA 12.1 wheels.
+# ─────────────────────────────────────────────────────────────
+
+# AWS
+boto3[crt]>=1.42.57
+
+# Data
+numpy>=2.4.2
+pandas>=2.3.3
+pyarrow>=19.0.0
+
+# ML
+scikit-learn>=1.8.0
+
+# Experiment tracking
+mlflow>=3.10.1
+
+# Visualization (useful in processing/evaluation steps)
+matplotlib>=3.10.8
+seaborn>=0.13.2
+
+# Utilities
+python-dotenv>=1.2.1
+
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch>=2.1.0

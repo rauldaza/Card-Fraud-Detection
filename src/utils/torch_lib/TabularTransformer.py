@@ -110,7 +110,7 @@ class TransactionDataset(Dataset):
         self.cat_idx = config['cat']  
 
         # Load the data and splits X and y
-        df = pd.read_csv(csv_path)
+        df = pd.read_feather(csv_path)
         
         if target_col and target_col in df.columns:
             self.y = torch.tensor(df[target_col].values, dtype=torch.long)

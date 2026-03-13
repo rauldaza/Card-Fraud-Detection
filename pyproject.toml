@@ -9,13 +9,17 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "boto3[crt]>=1.42.57",
     "ipykernel>=7.2.0",
     "ipywidgets>=8.1.8",
     "matplotlib>=3.10.8",
-    "mlflow>=3.9.0",
+    "mlflow==3.10.1",
     "numpy>=2.4.2",
     "pandas>=2.3.3",
+    "psycopg2-binary>=2.9.11",
+    "pytest>=9.0.2",
     "python-dotenv>=1.2.1",
+    "sagemaker>=2.200,<3.0",
     "scikit-learn>=1.8.0",
     "seaborn>=0.13.2",
     "torch>=2.10.0",
@@ -26,3 +30,6 @@ where = ["src"]
 
 [tool.uv]
 managed = true
+
+[tool.uv.extra-build-dependencies]
+card-fraud-detection = ["boto3[crt]"]

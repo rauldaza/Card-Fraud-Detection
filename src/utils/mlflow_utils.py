@@ -44,7 +44,11 @@ def upload_mlflow_db(local_path: str,
     """
     Push the updated mlflow.db back to S3 after a run closes.
     Call OUTSIDE `with mlflow.start_run()` so the run is fully flushed first.
+    Set LOCAL_MODE=1 to skip the upload during local testing.
     """
+    if os.environ.get("LOCAL_MODE") == "1":
+        logger.info("LOCAL_MODE=1 — skipping MLflow S3 upload.")
+        return
     boto3.client("s3").upload_file(local_path, bucket, key)
     logger.info(f"MLflow db uploaded    → s3://{bucket}/{key}")
 

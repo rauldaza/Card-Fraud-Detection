@@ -138,6 +138,7 @@ def build_clients(session: boto3.Session) -> dict:
         "iam": session.client("iam", region_name=REGION),
         "rds": session.client("rds", region_name=REGION),
         "ecr": session.client("ecr", region_name=REGION),
+        "ec2": session.client("ec2", region_name=REGION),
     }
 
 # ---------------------------------------------------------------------------
@@ -435,6 +436,37 @@ def _delete_iam_role(iam_client) -> None:
 # RDS helpers
 # ---------------------------------------------------------------------------
 
+def _authorize_rds_ingress(clients: dict, db_instance_identifier: str, port: int) -> None:
+    """Authorize ingress on the RDS instance's VPC security group for the specified port."""
+    try:
+        instance = clients["rds"].describe_db_instances(
+            DBInstanceIdentifier=db_instance_identifier
+        )["DBInstances"][0]
+        sg_id = instance["VpcSecurityGroups"][0]["VpcSecurityGroupId"]
+        
+        try:
+            clients["ec2"].authorize_security_group_ingress(
+                GroupId=sg_id,
+                IpPermissions=[
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": port,
+                        "ToPort": port,
+                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                    }
+                ],
+            )
+            logger.info(f"[RDS] Authorized public ingress to security group {sg_id} on port {port}.")
+        except clients["ec2"].exceptions.ClientError as e:
+            if "InvalidPermission.Duplicate" in str(e):
+                logger.info(f"[RDS] Security group rule already exists for port {port} on {sg_id}.")
+            else:
+                logger.error(f"[RDS] Failed to authorize ingress: {e}")
+                raise
+    except Exception as e:
+        logger.warning(f"[RDS] Could not authorize SG ingress automatically: {e}")
+
+
 def create_rds(clients: dict, account_id: str) -> None:
     """Create IAM role + RDS instance and link them."""
     db_password = os.getenv("DB_MASTER_PASSWORD", DB_MASTER_PASS)
@@ -486,6 +518,9 @@ def create_rds(clients: dict, account_id: str) -> None:
     host = instance["Endpoint"]["Address"]
     port = instance["Endpoint"]["Port"]
     logger.info(f"[RDS] ✅ Endpoint: {host}:{port}")
+
+    # Ensure security group rule allows inbound connection so script doesn't time out
+    _authorize_rds_ingress(clients, DB_INSTANCE_ID, RDS_PORT)
 
 
 def delete_rds(clients: dict) -> None:

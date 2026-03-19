@@ -1,13 +1,20 @@
 """
-MLOps_pipeline.py — SageMaker Fraud Detection End-to-End Pipeline
-=================================================================
-Four-step pipeline connecting pretrain and train-eval:
-  1. SplitData             – reads from RDS, writes train/test feather to S3
-  2. TabPreprocessing      – fits sklearn preprocessor, saves .pkl to S3
-  3. TrainTabularTransformer – trains the model on GPU
-  4. EvaluateTabularTransformer – evaluates the model, logs to MLflow
+ft_MLOps_pipeline.py — Config-Driven SageMaker Pipeline
+========================================================
+Builds the full fraud-detection pipeline by looping over the ``models``
+array in config.json.  Each model entry defines its own scripts, S3
+prefixes, and training hyperparameters so adding a new model is a pure
+config change — no pipeline code modifications required.
 
-Reads all configuration from config.json.
+Pipeline DAG:
+  SplitData
+     ├── TabularTransformer_Preprocessing → TabularTransformer_Training → TabularTransformer_Evaluation
+     └── FTTransformer_Preprocessing      → FTTransformer_Training      → FTTransformer_Evaluation
+
+Usage:
+  python ft_MLOps_pipeline.py
+
+Which models run is determined entirely by the ``models`` array in config.json.
 Toggle TEST_MODE below to switch between a quick validation run and a full run.
 """
 
@@ -21,182 +28,273 @@ from sagemaker.workflow.pipeline import Pipeline
 from sagemaker.workflow.pipeline_context import PipelineSession
 from sagemaker.workflow.steps import ProcessingStep
 
+from MLOps_pipeline import (
+    load_config,
+    build_paths,
+    setup_vpc_networking,
+    build_split_args,
+)
+
 # ─── Test / Full-run Toggle ──────────────────────────────────────────────────
-TEST_MODE = True   # Set to False for a full 10-epoch training run
+TEST_MODE = True   # Set to False for a full training run
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def load_config(path: str = "config.json") -> dict:
-    """Load pipeline configuration from a JSON file."""
-    with open(path) as f:
-        return json.load(f)
-
-
-def build_paths(cfg: dict) -> dict:
-    """Derive all S3 URIs and ECR image URIs from the config.
-
-    Every derived value uses aws.account_id so there is only one
-    place to change when switching AWS accounts.
+def build_model_s3_paths(cfg: dict, model_cfg: dict) -> dict:
     """
-    account = cfg["aws"]["account_id"]
-    region  = cfg["aws"]["region"]
+    Build fully-qualified S3 URIs for a single model's artifacts.
 
-    data_bucket   = f"{cfg['s3']['data_bucket_prefix']}-{account}"
+    Parameters
+    ----------
+    cfg : dict
+        Top-level pipeline config (needs ``s3.models_bucket_prefix``; AWS
+        account ID is derived dynamically from boto3 STS).
+    model_cfg : dict
+        One element from ``cfg["models"]``, containing ``s3_prefixes``.
+
+    Returns
+    -------
+    dict
+        Keys: ``s3_pkl``, ``s3_output``, ``s3_eval`` — full S3 URIs.
+    """
+    account       = boto3.client("sts").get_caller_identity()["Account"]
     models_bucket = f"{cfg['s3']['models_bucket_prefix']}-{account}"
-
-    data   = f"s3://{data_bucket}"
-    models = f"s3://{models_bucket}"
+    base          = f"s3://{models_bucket}"
+    prefixes      = model_cfg["s3_prefixes"]
 
     return {
-        # Resolved role ARN
-        "role_arn": f"arn:aws:iam::{account}:role/{cfg['aws']['role_name']}",
-        # Docker images
-        "pretrain_image": (
-            f"{account}.dkr.ecr.{region}.amazonaws.com"
-            f"/{cfg['ecr']['pretrain_repo']}:{cfg['ecr']['pretrain_tag']}"
-        ),
-        "train_image": (
-            f"{account}.dkr.ecr.{region}.amazonaws.com"
-            f"/{cfg['ecr']['train_repo']}:{cfg['ecr']['train_tag']}"
-        ),
-        # S3 paths — pretrain
-        "s3_split_train": f"{data}/{cfg['s3']['split_train_key']}",
-        "s3_split_test":  f"{data}/{cfg['s3']['split_test_key']}",
-        "s3_pkl":         f"{models}/{cfg['s3']['pkl_key']}",
-        # S3 paths — train/eval
-        # s3_train / s3_test removed: Steps 3+4 use lazy split URIs from Step 1
-        "s3_output":      f"{models}/{cfg['s3']['output_prefix']}",
-        "s3_eval":        f"{models}/{cfg['s3']['eval_prefix']}",
+        "s3_pkl":    f"{base}/{prefixes['pkl']}",
+        "s3_output": f"{base}/{prefixes['output']}",
+        "s3_eval":   f"{base}/{prefixes['eval']}",
     }
 
 
-def setup_vpc_networking(ec2_client, rds_client, cfg: dict, region: str) -> dict:
+def build_training_args_from_config(model_cfg: dict, test_mode: bool) -> list[str]:
     """
-    Fetch RDS networking info and ensure the VPC is ready for SageMaker:
-      - Self-referencing inbound rule on the RDS port
-      - S3 Gateway Endpoint (SageMaker in a VPC has no internet access)
+    Build CLI arguments for a model's training script from its config entry.
 
-    Returns a dict with keys: subnets, security_group_ids, rds_host, rds_port.
+    Always emits ``--epochs``, ``--batch-size``, and ``--target-col``.
+    Any **additional** keys in the ``full_run`` / ``test_run`` dict are
+    flattened to ``--key-name value`` (underscores → hyphens), so
+    model-specific args like ``--embed-dim`` or ``--d-model`` require
+    zero code changes — just add them to the config.
+
+    Parameters
+    ----------
+    model_cfg : dict
+        One element from ``cfg["models"]``.
+    test_mode : bool
+        If True, use ``training_args.test_run``; otherwise ``full_run``.
+
+    Returns
+    -------
+    list[str]
+        Flat list of CLI argument strings.
     """
-    # ── Fetch RDS instance details ────────────────────────────────────────────
-    db_instance = rds_client.describe_db_instances(
-        DBInstanceIdentifier=cfg["rds"]["db_identifier"]
-    )["DBInstances"][0]
+    t = model_cfg["training_args"]
+    run_cfg = t["test_run"] if test_mode else t["full_run"]
 
-    rds_vpc_id = db_instance["DBSubnetGroup"]["VpcId"]
-    rds_subnets = [
-        s["SubnetIdentifier"]
-        for s in db_instance["DBSubnetGroup"]["Subnets"]
-    ]
-    rds_security_group_ids = [
-        sg["VpcSecurityGroupId"]
-        for sg in db_instance["VpcSecurityGroups"]
-        if sg["Status"] == "active"
-    ]
-
-    # ── Self-referencing SG rule ──────────────────────────────────────────────
-    rds_port = cfg["rds"]["port"]
-    for sg_id in rds_security_group_ids:
-        try:
-            ec2_client.authorize_security_group_ingress(
-                GroupId=sg_id,
-                IpPermissions=[{
-                    "IpProtocol": "tcp",
-                    "FromPort":   rds_port,
-                    "ToPort":     rds_port,
-                    "UserIdGroupPairs": [{"GroupId": sg_id}],
-                }],
-            )
-            print(f"[VPC] Added self-referencing inbound rule on port {rds_port} to {sg_id}")
-        except ec2_client.exceptions.ClientError as e:
-            if "Duplicate" in str(e) or "already exists" in str(e):
-                print(f"[VPC] Self-referencing rule already exists on {sg_id}")
-            else:
-                raise
-
-    # ── S3 Gateway Endpoint ───────────────────────────────────────────────────
-    s3_service_name = f"com.amazonaws.{region}.s3"
-    existing_endpoints = ec2_client.describe_vpc_endpoints(
-        Filters=[
-            {"Name": "vpc-id",       "Values": [rds_vpc_id]},
-            {"Name": "service-name", "Values": [s3_service_name]},
-        ]
-    )["VpcEndpoints"]
-
-    if not existing_endpoints:
-        route_tables = ec2_client.describe_route_tables(
-            Filters=[{"Name": "vpc-id", "Values": [rds_vpc_id]}]
-        )["RouteTables"]
-        route_table_ids = [rt["RouteTableId"] for rt in route_tables]
-
-        ec2_client.create_vpc_endpoint(
-            VpcId=rds_vpc_id,
-            ServiceName=s3_service_name,
-            VpcEndpointType="Gateway",
-            RouteTableIds=route_table_ids,
-        )
-        print(f"[VPC] Created S3 Gateway Endpoint for {rds_vpc_id}")
-    else:
-        print("[VPC] S3 Gateway Endpoint already exists")
-
-    print(f"[VPC] RDS VPC: {rds_vpc_id}")
-    print(f"[VPC] Subnets: {rds_subnets}")
-    print(f"[VPC] Security Groups: {rds_security_group_ids}")
-
-    return {
-        "subnets":            rds_subnets,
-        "security_group_ids": rds_security_group_ids,
-        "rds_host":           db_instance["Endpoint"]["Address"],
-        "rds_port":           str(db_instance["Endpoint"]["Port"]),
-    }
-
-
-def build_split_args(cfg: dict, vpc: dict, test_mode: bool) -> list[str]:
-    """Return the command-line arguments passed to data_split.py."""
-    ds = cfg["data_split"]
-    args = [
-        "--db-host",      vpc["rds_host"],
-        "--db-port",      vpc["rds_port"],
-        "--db-user",      cfg["rds"]["db_user"],
-        "--db-password",  cfg["rds"]["db_password"],
-        "--target",       ds["target_col"],
-        "--id-col",       ds["id_col"],
-        "--test-size",    str(ds["test_size"]),
-        "--random-state", str(ds["random_state"]),
-    ]
-    if not ds["stratify"]:
-        args.append("--no-stratify")
-    if test_mode:
-        args += ["--limit", str(cfg["test_run"]["limit"])]
-    return args
-
-
-def build_training_args(cfg: dict, test_mode: bool) -> list[str]:
-    """Return the command-line arguments passed to train.py."""
-    run_cfg = cfg["training"]["test_run"] if test_mode else cfg["training"]["full_run"]
     args = [
         "--epochs",     str(run_cfg["epochs"]),
-        "--batch-size", str(cfg["training"]["batch_size"]),
-        "--target-col", cfg["training"]["target_col"],
+        "--batch-size", str(t["batch_size"]),
+        "--target-col", t["target_col"],
     ]
-    if not test_mode:
-        args += [
-            "--learning-rate", str(run_cfg["learning_rate"]),
-            "--embed-dim",     str(run_cfg["embed_dim"]),
-        ]
+
+    # Flatten remaining keys (skip "epochs" — already handled)
+    for key, value in run_cfg.items():
+        if key == "epochs":
+            continue
+        cli_flag = f"--{key.replace('_', '-')}"
+        args += [cli_flag, str(value)]
+
     return args
+
+
+def build_model_branch(
+    model_cfg: dict,
+    model_s3: dict,
+    cfg: dict,
+    pretrain_processor: ScriptProcessor,
+    train_processor: ScriptProcessor,
+    split_train_uri,
+    split_test_uri,
+    test_mode: bool,
+    depends_on_steps: list = None,
+) -> list[ProcessingStep]:
+    """
+    Build the three pipeline steps (preprocess → train → eval) for one model.
+
+    Parameters
+    ----------
+    model_cfg : dict
+        One element from ``cfg["models"]``.
+    model_s3 : dict
+        S3 URIs from ``build_model_s3_paths()``.
+    cfg : dict
+        Top-level pipeline config.
+    pretrain_processor : ScriptProcessor
+        CPU processor (used for preprocessing).
+    train_processor : ScriptProcessor
+        GPU processor (used for training and evaluation).
+    split_train_uri : sagemaker.workflow.properties.Properties
+        Lazy S3 reference to the training split output.
+    split_test_uri : sagemaker.workflow.properties.Properties
+        Lazy S3 reference to the test split output.
+    test_mode : bool
+        If True, use test-run hyperparameters.
+    depends_on_steps : list, optional
+        A list of step names that this model's preprocessing step must wait for.
+
+    Returns
+    -------
+    list[ProcessingStep]
+        Three steps: [preprocessing, training, evaluation].
+    """
+    name    = model_cfg["name"]
+    scripts = model_cfg["scripts"]
+
+    # ── Preprocessing ────────────────────────────────────────────────────────
+    step_preprocess = ProcessingStep(
+        name=f"{name}_Preprocessing",
+        depends_on=depends_on_steps,
+        step_args=pretrain_processor.run(
+            code=scripts["preprocessing"],
+            arguments=["--target", cfg["data_split"]["target_col"]],
+            inputs=[
+                ProcessingInput(
+                    source=split_train_uri,
+                    destination="/opt/ml/processing/train",
+                    input_name="train-data",
+                ),
+            ],
+            outputs=[
+                ProcessingOutput(
+                    output_name="preprocessor",
+                    source="/opt/ml/processing/artifacts",
+                    destination=model_s3["s3_pkl"],
+                ),
+            ],
+        ),
+    )
+
+    pkl_uri = (
+        step_preprocess.properties
+        .ProcessingOutputConfig.Outputs["preprocessor"].S3Output.S3Uri
+    )
+
+    # ── Training ─────────────────────────────────────────────────────────────
+    training_args = build_training_args_from_config(model_cfg, test_mode)
+
+    step_train = ProcessingStep(
+        name=f"{name}_Training",
+        step_args=train_processor.run(
+            code=scripts["train"],
+            arguments=training_args,
+            inputs=[
+                ProcessingInput(
+                    source=split_train_uri,
+                    destination="/opt/ml/processing/input/train",
+                    input_name="train-data",
+                ),
+                ProcessingInput(
+                    source=split_test_uri,
+                    destination="/opt/ml/processing/input/test",
+                    input_name="test-data",
+                ),
+                ProcessingInput(
+                    source=pkl_uri,
+                    destination="/opt/ml/processing/input/config",
+                    input_name="preprocessing-config",
+                ),
+            ],
+            outputs=[
+                ProcessingOutput(
+                    output_name="model-checkpoint",
+                    source="/opt/ml/processing/output",
+                    destination=model_s3["s3_output"],
+                ),
+            ],
+        ),
+    )
+
+    model_uri = (
+        step_train.properties
+        .ProcessingOutputConfig.Outputs["model-checkpoint"].S3Output.S3Uri
+    )
+
+    # ── Evaluation ───────────────────────────────────────────────────────────
+    step_eval = ProcessingStep(
+        name=f"{name}_Evaluation",
+        step_args=train_processor.run(
+            code=scripts["test"],
+            arguments=[
+                "--test-data",  "/opt/ml/processing/input/test/transactions_test.feather",
+                "--model-dir",  "/opt/ml/processing/input/model",
+                "--config-dir", "/opt/ml/processing/input/config",
+                "--target-col", model_cfg["training_args"]["target_col"],
+            ],
+            inputs=[
+                ProcessingInput(
+                    source=split_test_uri,
+                    destination="/opt/ml/processing/input/test",
+                    input_name="test-data",
+                ),
+                ProcessingInput(
+                    source=pkl_uri,
+                    destination="/opt/ml/processing/input/config",
+                    input_name="preprocessing-config",
+                ),
+                ProcessingInput(
+                    source=model_uri,
+                    destination="/opt/ml/processing/input/model",
+                    input_name="model-checkpoint",
+                ),
+            ],
+            outputs=[
+                ProcessingOutput(
+                    output_name="evaluation-output",
+                    source="/opt/ml/processing/output",
+                    destination=model_s3["s3_eval"],
+                ),
+            ],
+        ),
+    )
+
+    return [step_preprocess, step_train, step_eval]
 
 
 def build_pipeline(
-    cfg: dict, paths: dict, vpc: dict,
-    split_args: list[str], training_args: list[str],
+    cfg: dict,
+    paths: dict,
+    vpc: dict,
+    split_args: list[str],
     pipeline_name: str,
+    test_mode: bool,
 ) -> tuple[Pipeline, boto3.Session]:
-    """Construct the four-step SageMaker pipeline."""
+    """
+    Construct the SageMaker pipeline: shared split + N model branches.
 
+    Parameters
+    ----------
+    cfg : dict
+        Top-level pipeline config.
+    paths : dict
+        Shared S3 paths from ``build_paths()``.
+    vpc : dict
+        VPC networking info from ``setup_vpc_networking()``.
+    split_args : list[str]
+        CLI arguments for ``data_split.py``.
+    pipeline_name : str
+        Name for the SageMaker pipeline.
+    test_mode : bool
+        If True, use test-run hyperparameters.
+
+    Returns
+    -------
+    tuple[Pipeline, boto3.Session]
+    """
     # ── AWS Sessions ──────────────────────────────────────────────────────────
     boto_session     = boto3.Session(
-        profile_name=cfg["aws"]["profile"],
         region_name=cfg["aws"]["region"],
     )
     pipeline_session = PipelineSession(boto_session=boto_session)
@@ -223,8 +321,6 @@ def build_pipeline(
     )
 
     # ── Processor 2: Train/Eval (GPU, no VPC) ─────────────────────────────────
-    # FIX: was cfg["aws"]["role"] (wrong key, inconsistent with everywhere else).
-    # FIX: added max_runtime_in_seconds — essential for long GPU training jobs.
     train_processor = ScriptProcessor(
         image_uri              = paths["train_image"],
         role                   = paths["role_arn"],
@@ -237,7 +333,7 @@ def build_pipeline(
     )
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Step 1: SplitData — read from RDS, write train/test feather to S3
+    # Step 1: SplitData — shared by all model branches
     # ══════════════════════════════════════════════════════════════════════════
     step_split = ProcessingStep(
         name="SplitData",
@@ -270,122 +366,34 @@ def build_pipeline(
     )
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Step 2: TabPreprocessing — fit preprocessor on train split
+    # Model branches — one per entry in selected_models
     # ══════════════════════════════════════════════════════════════════════════
-    step_preprocess = ProcessingStep(
-        name="TabPreprocessing",
-        step_args=pretrain_processor.run(
-            code="steps/tab_preprocessing.py",
-            arguments=[
-                "--target", cfg["data_split"]["target_col"],
-            ],
-            inputs=[
-                ProcessingInput(
-                    source=split_train_uri,
-                    destination="/opt/ml/processing/train",
-                    input_name="train-data",
-                ),
-            ],
-            outputs=[
-                ProcessingOutput(
-                    output_name="preprocessor",
-                    source="/opt/ml/processing/artifacts",
-                    destination=paths["s3_pkl"],
-                ),
-            ],
-        ),
-    )
+    all_steps = [step_split]
+    
+    branch_terminating_steps_names = []
+    max_concurrency = cfg.get("max_concurrent_models", 1)
 
-    # Lazy reference to the .pkl output
-    pkl_uri = (
-        step_preprocess.properties
-        .ProcessingOutputConfig.Outputs["preprocessor"].S3Output.S3Uri
-    )
+    for i, model_cfg in enumerate(cfg["models"]):
+        model_s3 = build_model_s3_paths(cfg, model_cfg)
+        
+        depends_on = None
+        if i >= max_concurrency:
+            depends_on = [branch_terminating_steps_names[i - max_concurrency]]
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Step 3: TrainTabularTransformer — train the model on GPU
-    # ══════════════════════════════════════════════════════════════════════════
-    step_train = ProcessingStep(
-        name="TrainTabularTransformer",
-        step_args=train_processor.run(
-            code="steps/train.py",
-            arguments=training_args,
-            inputs=[
-                ProcessingInput(
-                    source=split_train_uri,
-                    destination="/opt/ml/processing/input/train",
-                    input_name="train-data",
-                ),
-                ProcessingInput(
-                    source=split_test_uri,
-                    destination="/opt/ml/processing/input/test",
-                    input_name="test-data",
-                ),
-                ProcessingInput(
-                    source=pkl_uri,
-                    destination="/opt/ml/processing/input/config",
-                    input_name="preprocessing-config",
-                ),
-            ],
-            outputs=[
-                ProcessingOutput(
-                    output_name="model-checkpoint",
-                    source="/opt/ml/processing/output",
-                    destination=paths["s3_output"],
-                ),
-            ],
-        ),
-    )
-
-    # Lazy reference to the model checkpoint
-    model_s3_uri = (
-        step_train.properties
-        .ProcessingOutputConfig.Outputs["model-checkpoint"].S3Output.S3Uri
-    )
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Step 4: EvaluateTabularTransformer — evaluate model, log to MLflow
-    # ══════════════════════════════════════════════════════════════════════════
-    step_eval = ProcessingStep(
-        name="EvaluateTabularTransformer",
-        step_args=train_processor.run(
-            code="steps/test.py",
-            arguments=[
-                "--test-data",  "/opt/ml/processing/input/test/transactions_test.feather",
-                "--model-dir",  "/opt/ml/processing/input/model",
-                "--config-dir", "/opt/ml/processing/input/config",
-                "--target-col", cfg["training"]["target_col"],
-            ],
-            inputs=[
-                ProcessingInput(
-                    source=split_test_uri,
-                    destination="/opt/ml/processing/input/test",
-                    input_name="test-data",
-                ),
-                ProcessingInput(
-                    source=pkl_uri,
-                    destination="/opt/ml/processing/input/config",
-                    input_name="preprocessing-config",
-                ),
-                ProcessingInput(
-                    source=model_s3_uri,
-                    destination="/opt/ml/processing/input/model",
-                    input_name="model-checkpoint",
-                ),
-            ],
-            outputs=[
-                ProcessingOutput(
-                    output_name="evaluation-output",
-                    source="/opt/ml/processing/output",
-                    destination=paths["s3_eval"],
-                ),
-            ],
-        ),
-    )
+        branch_steps = build_model_branch(
+            model_cfg, model_s3, cfg,
+            pretrain_processor, train_processor,
+            split_train_uri, split_test_uri,
+            test_mode,
+            depends_on_steps=depends_on,
+        )
+        
+        branch_terminating_steps_names.append(branch_steps[-1].name)
+        all_steps.extend(branch_steps)
 
     return Pipeline(
         name=pipeline_name,
-        steps=[step_split, step_preprocess, step_train, step_eval],
+        steps=all_steps,
         sagemaker_session=pipeline_session,
     ), boto_session
 
@@ -397,7 +405,6 @@ def main():
 
     # ── AWS Clients ───────────────────────────────────────────────────────────
     boto_session = boto3.Session(
-        profile_name=cfg["aws"]["profile"],
         region_name=cfg["aws"]["region"],
     )
     ec2_client = boto_session.client("ec2")
@@ -407,40 +414,37 @@ def main():
     vpc = setup_vpc_networking(ec2_client, rds_client, cfg, cfg["aws"]["region"])
 
     # ── Build arguments ───────────────────────────────────────────────────────
-    split_args    = build_split_args(cfg, vpc, TEST_MODE)
-    training_args = build_training_args(cfg, TEST_MODE)
-    pipeline_name = "FraudDetection-TEST" if TEST_MODE else "FraudDetectionPipeline"
+    split_args = build_split_args(cfg, vpc, TEST_MODE)
+
+    suffix        = "TEST" if TEST_MODE else "FULL"
+    model_names   = [m["name"] for m in cfg["models"]]
+    pipeline_name = f"FraudDetection-{suffix}"
 
     # ── Print run summary ─────────────────────────────────────────────────────
     mode_label = "TEST MODE" if TEST_MODE else "FULL RUN"
+
     print(f"\n{'='*60}")
-    print(f"  {mode_label}")
+    print(f"  {mode_label}  |  Models: {', '.join(model_names)}")
     print(f"{'='*60}")
     print(f"  Pretrain instance: {cfg['pretrain_compute']['instance_type']} (CPU + VPC)")
     print(f"  Train instance:    {cfg['train_compute']['instance_type']} (GPU)")
     print(f"  Pipeline:          {pipeline_name}")
     print(f"  RDS Host:          {vpc['rds_host']}")
-    if TEST_MODE:
-        print(f"  Row Limit:         {cfg['test_run']['limit']}")
-        print(f"  Epochs:            {cfg['training']['test_run']['epochs']}")
-    else:
-        print(f"  Epochs:            {cfg['training']['full_run']['epochs']}")
     print(f"{'='*60}\n")
 
-    # ── Validate local scripts exist ──────────────────────────────────────────
-    scripts = [
-        "steps/data_split.py",
-        "steps/tab_preprocessing.py",
-        "steps/train.py",
-        "steps/test.py",
-    ]
-    for script in scripts:
+    # ── Validate local scripts ────────────────────────────────────────────────
+    scripts = {"steps/data_split.py"}
+    for m in cfg["models"]:
+        scripts.update(m["scripts"].values())
+
+    for script in sorted(scripts):
         if not os.path.exists(script):
             raise FileNotFoundError(f"Required script not found: {script}")
 
     # ── Build, register, and start pipeline ───────────────────────────────────
     pipeline, boto_session = build_pipeline(
-        cfg, paths, vpc, split_args, training_args, pipeline_name
+        cfg, paths, vpc, split_args,
+        pipeline_name, TEST_MODE,
     )
 
     print(f"Registering pipeline '{pipeline_name}' ...")
